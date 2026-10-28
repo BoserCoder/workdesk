@@ -1,0 +1,540 @@
+/* ==========================================================================
+   WORKDESK / TRUFFLING - login + game library (Cloudflare Pages & Vercel)
+
+   Everything lives in this one file. Deploy the folder containing it.
+
+   HOW IT PROTECTS THE LINKS
+   - The login check happens on the SERVER (this worker), not in the browser.
+   - Game URLs never leave the server until you are logged in. The page only
+     ever receives names + /go/<id> paths; /go/<id> redirects to the real URL
+     and only works with a valid signed session cookie.
+   - The page also closes itself if someone tries devtools, right-click,
+     Ctrl+S, Ctrl+U, F12 etc.
+
+   TO ADD GAMES: add a line to the GAMES list below and redeploy.
+   ========================================================================== */
+
+// ---- LOGIN (checked on the server, never sent to the browser) ------------
+const USER = 'skoda';
+const PASS = 'schooliscool@123';
+
+// ---- GAMES: add more here ------------------------------------------------
+// id   = short unique name using letters/numbers/dashes only
+// name = what shows on the card
+// tag  = small label under the name (genre etc.)
+// newTab = optional, true to open in a new tab instead of the iframe
+// url  = the real link (only revealed after login)
+const GAMES = [
+  { id: 'truffling', name: 'Truffling', tag: 'Games hub', url: 'https://truffling.soon.it/' },
+ { id: 'games', name: 'More Games', tag: 'Games', url: 'https://s3.amazonaws.com/desynctutorsyou/index.html' },
+  { id: 'movies', name: 'Movies', tag: 'Watch', url: 'https://truffling.soon.it/search.html?url=https%3A%2F%2Fcinera.cfd' },
+  { id: 'soundboard', name: 'Soundboard', tag: 'Audio', url: 'https://voicechanger.easeus.com/soundboards' },
+  { id: 'talk', name: 'Talk to Each other', tag: 'Make an account without email and add each other to chat', url: 'https://mathfun.unavida.cl/' },
+
+
+
+
+];
+
+// ---- SESSION SETTINGS ----------------------------------------------------
+const COOKIE = 'tsid';
+const SESSION_HOURS = 8;
+// Optional: set SESSION_SECRET (Cloudflare: Pages > Settings > Variables and Secrets,
+// Vercel: Project > Settings > Environment Variables).
+// If you don't, a secret is derived from the password above.
+const secretOf = (env) => (env && env.SESSION_SECRET) || (PASS + '::truffling-session-v1');
+
+// ---- helpers -------------------------------------------------------------
+const enc = new TextEncoder();
+
+async function hmac(secret, msg) {
+  const key = await crypto.subtle.importKey(
+    'raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(msg));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// compares hashes of both values so timing leaks nothing useful
+async function safeEqual(a, b) {
+  return (await hmac('cmp', a)) === (await hmac('cmp', b));
+}
+
+function getCookie(request, name) {
+  const raw = request.headers.get('Cookie') || '';
+  for (const part of raw.split(';')) {
+    const i = part.indexOf('=');
+    if (i > -1 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return '';
+}
+
+async function isAuthed(request, env) {
+  const tok = getCookie(request, COOKIE);
+  const dot = tok.indexOf('.');
+  if (dot < 1) return false;
+  const exp = tok.slice(0, dot);
+  const sig = tok.slice(dot + 1);
+  if (!/^\d+$/.test(exp) || Number(exp) < Date.now()) return false;
+  return safeEqual(sig, await hmac(secretOf(env), exp));
+}
+
+const SEC = {
+  'Cache-Control': 'no-store',
+  'X-Frame-Options': 'DENY',
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'no-referrer',
+  'X-Robots-Tag': 'noindex, nofollow, noarchive',
+};
+
+function json(obj, status = 200, extra = {}) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { ...SEC, 'Content-Type': 'application/json', ...extra },
+  });
+}
+
+const cookieHeader = (value, maxAge) =>
+  COOKIE + '=' + value + '; Path=/; Max-Age=' + maxAge + '; HttpOnly; Secure; SameSite=Strict';
+
+// ---- routes --------------------------------------------------------------
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
+    if (path === '/' && method === 'GET') {
+      // Serve index.html from the uploaded files; fall back to the copy
+      // embedded below if it isn't there.
+      let body = PAGE;
+      try {
+        if (env && env.ASSETS) {
+          const r = await env.ASSETS.fetch(request);
+          if (r.ok && (r.headers.get('content-type') || '').includes('text/html')) {
+            body = await r.text();
+          }
+        }
+      } catch (e) { /* use embedded page */ }
+      return new Response(body, {
+        headers: { ...SEC, 'Content-Type': 'text/html; charset=utf-8' },
+      });
+    }
+
+    if (path === '/api/login' && method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch (e) { return json({ ok: false }, 400); }
+      const okU = await safeEqual(String(body.u || ''), USER);
+      const okP = await safeEqual(String(body.p || ''), PASS);
+      if (!(okU && okP)) {
+        await new Promise((r) => setTimeout(r, 700)); // slows down guessing
+        return json({ ok: false }, 401);
+      }
+      const exp = String(Date.now() + SESSION_HOURS * 3600 * 1000);
+      const sig = await hmac(secretOf(env), exp);
+      return json({ ok: true }, 200, {
+        'Set-Cookie': cookieHeader(exp + '.' + sig, SESSION_HOURS * 3600),
+      });
+    }
+
+    if (path === '/api/logout' && method === 'POST') {
+      return json({ ok: true }, 200, { 'Set-Cookie': cookieHeader('', 0) });
+    }
+
+    if (path === '/api/games' && method === 'GET') {
+      if (!(await isAuthed(request, env))) return json({ ok: false }, 401);
+      // note: no URLs are sent here, only names
+      return json(GAMES.map((g) => ({ id: g.id, name: g.name, tag: g.tag || '', newTab: !!g.newTab })));
+    }
+
+    if (path.startsWith('/go/') && method === 'GET') {
+      if (!(await isAuthed(request, env))) {
+        return new Response(null, { status: 302, headers: { ...SEC, Location: '/' } });
+      }
+      let id = '';
+      try { id = decodeURIComponent(path.slice(4)); } catch (e) { /* ignore */ }
+      const game = GAMES.find((g) => g.id === id);
+      if (!game) return new Response('Not found', { status: 404, headers: SEC });
+      return new Response(null, { status: 302, headers: { ...SEC, Location: game.url } });
+    }
+
+    if (path === '/favicon.ico') {
+      try {
+        if (env && env.ASSETS) {
+          const r = await env.ASSETS.fetch(request);
+          if (r.ok) {
+            return new Response(r.body, {
+              status: 200,
+              headers: { 'Content-Type': 'image/x-icon', 'Cache-Control': 'public, max-age=86400' },
+            });
+          }
+        }
+      } catch (e) { /* fall through */ }
+      return new Response(null, { status: 204, headers: SEC });
+    }
+
+    return new Response('Not found', { status: 404, headers: SEC });
+  },
+};
+
+// ---- the page (no secrets in here, by design) -----------------------------
+const PAGE = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Truffling</title>
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#07060a;
+  --panel:#100b0f;
+  --red:#ff1f3d;
+  --red-hi:#ff5069;
+  --red-dim:#5c1824;
+  --ink:#f4e9eb;
+  --mute:#9a8489;
+  --cut:16px;
+}
+html,body{min-height:100%}
+body{
+  background-color:var(--bg);
+  background-image:
+    radial-gradient(ellipse 80% 55% at 50% -8%,rgba(255,31,61,.26),transparent 70%),
+    linear-gradient(rgba(255,31,61,.045) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(255,31,61,.045) 1px,transparent 1px);
+  background-size:auto,44px 44px,44px 44px;
+  background-attachment:fixed;
+  color:var(--ink);
+  font-family:'Rajdhani',system-ui,sans-serif;
+  font-size:19px;
+  line-height:1.4;
+  -webkit-user-select:none;user-select:none;
+  -webkit-touch-callout:none;
+}
+input{-webkit-user-select:text;user-select:text}
+[hidden]{display:none!important}
+a{color:inherit;text-decoration:none}
+
+/* wordmark */
+.mark{
+  font-family:'Orbitron',sans-serif;font-weight:900;
+  letter-spacing:.28em;text-transform:uppercase;
+  color:var(--ink);
+  text-shadow:0 0 22px rgba(255,31,61,.55);
+}
+.mark b{color:var(--red);font-weight:900}
+
+/* chamfered corners */
+.cut{clip-path:polygon(var(--cut) 0,100% 0,100% calc(100% - var(--cut)),calc(100% - var(--cut)) 100%,0 100%,0 var(--cut))}
+
+/* ---------- login ---------- */
+#login{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.frame{width:100%;max-width:420px;padding:1px;background:linear-gradient(150deg,var(--red) 0%,var(--red-dim) 45%,var(--red) 100%);--cut:22px}
+.card{background:var(--panel);padding:44px 36px 36px;--cut:22px}
+.card .mark{font-size:30px;text-align:center}
+.card .sub{text-align:center;color:var(--mute);font-weight:600;letter-spacing:.12em;margin:8px 0 34px;font-size:16px}
+label{display:block;font-family:'Orbitron',sans-serif;font-size:12px;font-weight:500;letter-spacing:.14em;color:var(--mute);margin-bottom:6px}
+.field{margin-bottom:22px}
+input[type=text],input[type=password],input[type=search]{
+  width:100%;background:#0a0709;border:1px solid var(--red-dim);border-left:3px solid var(--red);
+  color:var(--ink);font:600 20px 'Rajdhani',sans-serif;letter-spacing:.04em;
+  padding:11px 14px;outline:none;border-radius:0;
+}
+input:focus{border-color:var(--red);box-shadow:0 0 0 1px var(--red),0 0 18px rgba(255,31,61,.25)}
+.btn{
+  width:100%;border:0;cursor:pointer;background:var(--red);color:#0b0608;
+  font-family:'Orbitron',sans-serif;font-weight:700;font-size:15px;letter-spacing:.22em;
+  padding:15px 18px;--cut:12px;margin-top:6px;
+}
+.btn:hover{background:var(--red-hi)}
+.btn:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+.err{min-height:24px;margin-top:16px;text-align:center;color:var(--red-hi);font-weight:600;letter-spacing:.06em}
+
+/* ---------- library ---------- */
+#app{min-height:100vh;padding:0 0 60px}
+.top{
+  display:flex;align-items:center;justify-content:space-between;gap:16px;
+  padding:20px clamp(18px,5vw,56px);border-bottom:1px solid var(--red-dim);
+  background:rgba(7,6,10,.82);
+}
+.top .mark{font-size:20px}
+.ghost{
+  background:transparent;border:1px solid var(--red-dim);color:var(--ink);cursor:pointer;
+  font-family:'Orbitron',sans-serif;font-size:12px;letter-spacing:.18em;padding:10px 16px;--cut:8px;
+}
+.ghost:hover{border-color:var(--red);color:var(--red-hi)}
+.wrap{max-width:1180px;margin:0 auto;padding:44px clamp(18px,5vw,56px) 0}
+.head{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;flex-wrap:wrap;margin-bottom:30px}
+h2{font-family:'Orbitron',sans-serif;font-weight:700;font-size:clamp(26px,4vw,38px);letter-spacing:.08em}
+.count{color:var(--mute);font-weight:600;margin-top:4px}
+.search{width:min(320px,100%)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:18px}
+.game,.slot{
+  display:flex;flex-direction:column;justify-content:space-between;min-height:150px;padding:20px 20px 18px;--cut:16px;
+}
+.game{
+  background:linear-gradient(160deg,#1c0d12 0%,var(--panel) 70%);
+  box-shadow:inset 0 0 0 1px var(--red-dim);
+}
+.game:hover{background:linear-gradient(160deg,#2a1017 0%,#150b10 70%);box-shadow:inset 0 0 0 1px var(--red)}
+.game:focus-visible{outline:2px solid var(--ink);outline-offset:-4px}
+.game .name{font-family:'Orbitron',sans-serif;font-weight:700;font-size:17px;letter-spacing:.06em;line-height:1.3}
+.game .tag{color:var(--mute);font-weight:600;margin-top:6px}
+.game .go{color:var(--red);font-family:'Orbitron',sans-serif;font-size:12px;letter-spacing:.2em;font-weight:700}
+.slot{
+  border:1px dashed var(--red-dim);color:var(--mute);justify-content:center;align-items:flex-start;gap:4px;
+}
+.slot b{font-family:'Orbitron',sans-serif;font-weight:500;letter-spacing:.08em;font-size:15px;color:var(--ink)}
+.empty{color:var(--mute);padding:30px 0}
+
+/* ---------- player (iframe) ---------- */
+#player{position:fixed;inset:0;display:flex;flex-direction:column;background:var(--bg)}
+#player .top{padding:0 8px;height:20px;min-height:20px;gap:8px;background:#0a0709}
+#player .ptitle{display:none}
+#player .ghost{border:0;height:16px;line-height:16px;padding:0 8px;font-size:9px;letter-spacing:.16em;--cut:4px;opacity:.65;color:var(--red-hi)}
+#player .ghost:hover{opacity:1}
+#frame{flex:1;width:100%;border:0;background:#000}
+</style>
+</head>
+<body>
+
+<noscript><p style="padding:40px;color:#9a8489">Enable JavaScript to continue.</p></noscript>
+
+<!-- login screen -->
+<main id="login" hidden>
+  <div class="frame cut">
+    <form class="card cut" id="form" autocomplete="on">
+      <div class="mark">Truffl<b>ing</b></div>
+      <div class="sub">Sign in to open the game library</div>
+      <div class="field">
+        <label for="u">USERNAME</label>
+        <input type="text" id="u" name="username" autocomplete="username" autocapitalize="off" spellcheck="false" required>
+      </div>
+      <div class="field">
+        <label for="p">PASSWORD</label>
+        <input type="password" id="p" name="password" autocomplete="current-password" required>
+      </div>
+      <button class="btn cut" type="submit" id="go">SIGN IN</button>
+      <div class="err" id="err" role="alert"></div>
+      <div style="text-align:center;font-size:11px;color:#3a2a2e;letter-spacing:.1em">build 6</div>
+    </form>
+  </div>
+</main>
+
+<!-- game library (links are only fetched after login) -->
+<div id="app" hidden>
+  <header class="top">
+    <div class="mark">Truffl<b>ing</b></div>
+    <button class="ghost cut" id="out" type="button">SIGN OUT</button>
+  </header>
+  <div class="wrap">
+    <div class="head">
+      <div>
+        <h2>Game library</h2>
+        <div class="count" id="count"></div>
+      </div>
+      <input class="search" type="search" id="q" placeholder="Search games" autocomplete="off" spellcheck="false" aria-label="Search games">
+    </div>
+    <div class="grid" id="grid"></div>
+    <div class="empty" id="none" hidden>No games match that search.</div>
+  </div>
+</div>
+
+<!-- iframe player -->
+<div id="player" hidden>
+  <header class="top">
+    <button class="ghost cut" id="back" type="button">BACK</button>
+    <div class="ptitle" id="ptitle"></div>
+    <button class="ghost cut" id="out2" type="button">SIGN OUT</button>
+  </header>
+  <iframe id="frame" title="Game" allow="fullscreen; autoplay; gamepad; clipboard-write" allowfullscreen referrerpolicy="no-referrer"></iframe>
+</div>
+
+<script>
+(function(){
+'use strict';
+
+/* ------------------------------------------------------------------
+   Lock-down: closes the page on right-click, devtools, view-source,
+   save-page, and framing. The real protection is server-side (links
+   are never in this page); this layer just shuts casual snooping.
+------------------------------------------------------------------- */
+var dead=false;
+function kill(){
+  if(dead)return;dead=true;
+  try{navigator.sendBeacon('/api/logout');}catch(e){}
+  try{document.documentElement.innerHTML='';}catch(e){}
+  try{window.open('','_self');window.close();}catch(e){}
+  try{location.replace('about:blank');}catch(e){}
+}
+
+if(window.top!==window.self){kill();}
+
+document.addEventListener('contextmenu',function(e){e.preventDefault();kill();},true);
+document.addEventListener('mousedown',function(e){if(e.button===2){e.preventDefault();kill();}},true);
+document.addEventListener('auxclick',function(e){if(e.button===2){e.preventDefault();kill();}},true);
+['dragstart','selectstart','copy','cut'].forEach(function(t){
+  document.addEventListener(t,function(e){
+    var el=e.target;
+    if(el&&el.tagName==='INPUT')return;
+    e.preventDefault();
+  },true);
+});
+
+window.addEventListener('keydown',function(e){
+  var c=e.code,m=e.ctrlKey||e.metaKey;
+  var bad=
+    c==='F12'||
+    (m&&e.shiftKey&&(c==='KeyI'||c==='KeyJ'||c==='KeyC'||c==='KeyK'))||
+    (m&&(c==='KeyS'||c==='KeyU'))||
+    (e.metaKey&&e.altKey&&(c==='KeyI'||c==='KeyJ'||c==='KeyU'||c==='KeyC'));
+  if(bad){e.preventDefault();e.stopPropagation();kill();}
+},true);
+
+/* devtools detection */
+function dbgCheck(){
+  var t=performance.now();
+  (function(){}).constructor('debugger')();
+  if(performance.now()-t>80)kill();
+}
+var probe=new Image();
+Object.defineProperty(probe,'id',{get:function(){kill();return '';}});
+function consoleCheck(){console.log(probe);console.clear();}
+var touch=!!(window.matchMedia&&window.matchMedia('(pointer:coarse)').matches&&!window.matchMedia('(pointer:fine)').matches);
+
+/* docked devtools: window inner size shrinks vs. outer size. We take a
+   baseline at load and kill if the gap grows. Re-baselines on zoom. */
+var base={w:window.outerWidth-window.innerWidth,h:window.outerHeight-window.innerHeight,r:window.devicePixelRatio};
+function sizeCheck(){
+  if(touch||dead)return;
+  if(window.devicePixelRatio!==base.r){
+    base={w:window.outerWidth-window.innerWidth,h:window.outerHeight-window.innerHeight,r:window.devicePixelRatio};
+    return;
+  }
+  var dw=window.outerWidth-window.innerWidth,dh=window.outerHeight-window.innerHeight;
+  if(dw-base.w>90||dh-base.h>90)kill();
+}
+window.addEventListener('resize',sizeCheck);
+
+/* heartbeat worker: a "debugger" statement freezes the worker whenever
+   devtools (docked OR undocked) is open, so the heartbeat stops */
+try{
+  var last=Date.now();
+  var wk=new Worker(URL.createObjectURL(new Blob(
+    ['setInterval(function(){debugger;postMessage(1);},150);'],
+    {type:'text/javascript'})));
+  wk.onmessage=function(){last=Date.now();};
+  setInterval(function(){if(Date.now()-last>900)kill();},250);
+}catch(e){}
+
+function allChecks(){dbgCheck();consoleCheck();sizeCheck();}
+setInterval(allChecks,250);
+window.addEventListener('blur',function(){setTimeout(allChecks,50);setTimeout(allChecks,400);});
+document.addEventListener('visibilitychange',allChecks);
+dbgCheck();
+
+/* ------------------------------------------------------------------
+   App
+------------------------------------------------------------------- */
+if(dead)return;
+var $=function(id){return document.getElementById(id);};
+var login=$('login'),app=$('app'),errBox=$('err'),grid=$('grid');
+
+var player=$('player'),frame=$('frame');
+function showLogin(){
+  frame.src='about:blank';
+  player.hidden=true;app.hidden=true;login.hidden=false;
+  $('p').value='';
+  setTimeout(function(){$('u').focus();},0);
+}
+function showApp(){
+  frame.src='about:blank';
+  player.hidden=true;login.hidden=true;app.hidden=false;
+}
+function openGame(g){
+  if(g.newTab){window.open('/go/'+encodeURIComponent(g.id),'_blank','noopener,noreferrer');return;}
+  $('ptitle').textContent=g.name;
+  frame.src='/go/'+encodeURIComponent(g.id);
+  app.hidden=true;login.hidden=true;player.hidden=false;
+}
+function signOut(){
+  fetch('/api/logout',{method:'POST',credentials:'same-origin'}).then(function(){
+    grid.innerHTML='';$('u').value='';showLogin();
+  });
+}
+$('back').addEventListener('click',showApp);
+$('out2').addEventListener('click',signOut);
+
+function renderGames(list){
+  grid.innerHTML='';
+  list.forEach(function(g){
+    var a=document.createElement('a');
+    a.className='game cut';
+    a.href='/go/'+encodeURIComponent(g.id);
+    a.addEventListener('click',function(ev){ev.preventDefault();openGame(g);});
+    a.setAttribute('data-s',(g.name+' '+(g.tag||'')).toLowerCase());
+    var top=document.createElement('div');
+    var n=document.createElement('div');n.className='name';n.textContent=g.name;
+    var t=document.createElement('div');t.className='tag';t.textContent=g.tag||'';
+    top.appendChild(n);top.appendChild(t);
+    var go=document.createElement('div');go.className='go';go.textContent='PLAY';
+    a.appendChild(top);a.appendChild(go);
+    grid.appendChild(a);
+  });
+  for(var i=0;i<2;i++){
+    var s=document.createElement('div');
+    s.className='slot cut';s.setAttribute('data-slot','1');
+    s.innerHTML='<b>Open slot</b><span>More games coming soon</span>';
+    grid.appendChild(s);
+  }
+  $('count').textContent=list.length+(list.length===1?' game':' games')+' available';
+  showApp();
+}
+
+function loadGames(){
+  return fetch('/api/games',{credentials:'same-origin',cache:'no-store'})
+    .then(function(r){if(!r.ok)throw 0;return r.json();})
+    .then(renderGames)
+    .catch(showLogin);
+}
+
+$('form').addEventListener('submit',function(e){
+  e.preventDefault();
+  errBox.textContent='';
+  var btn=$('go');btn.disabled=true;
+  fetch('/api/login',{
+    method:'POST',credentials:'same-origin',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({u:$('u').value,p:$('p').value})
+  }).then(function(r){
+    if(!r.ok)throw 0;
+    return loadGames();
+  }).catch(function(){
+    errBox.textContent='Wrong username or password. Try again.';
+    $('p').value='';$('p').focus();
+  }).then(function(){btn.disabled=false;});
+});
+
+$('out').addEventListener('click',signOut);
+
+$('q').addEventListener('input',function(){
+  var q=this.value.trim().toLowerCase(),shown=0;
+  Array.prototype.forEach.call(grid.children,function(el){
+    if(el.getAttribute('data-slot')){el.hidden=!!q;return;}
+    var hit=!q||el.getAttribute('data-s').indexOf(q)>-1;
+    el.hidden=!hit;if(hit)shown++;
+  });
+  $('none').hidden=!(q&&shown===0);
+});
+
+loadGames();
+})();
+</script>
+</body>
+</html>`;
