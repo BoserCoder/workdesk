@@ -1,0 +1,39 @@
+{
+  "framework": null,
+  "buildCommand": "mkdir -p public && cp index.html favicon.ico public/",
+  "outputDirectory": "public",
+  "rewrites": [
+    { "source": "/api/login",  "destination": "/api/server?p=/api/login" },
+    { "source": "/api/logout", "destination": "/api/server?p=/api/logout" },
+    { "source": "/api/games",  "destination": "/api/server?p=/api/games" },
+    { "source": "/go/:id",     "destination": "/api/server?p=/go/:id" }
+  ],
+  "headers": [
+    {
+      "source": "/",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-store" },
+        { "key": "X-Frame-Options", "value": "DENY" },
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "no-referrer" },
+        { "key": "X-Robots-Tag", "value": "noindex, nofollow, noarchive" }
+      ]
+    },
+    {
+      "source": "/index.html",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-store" },
+        { "key": "X-Frame-Options", "value": "DENY" },
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "no-referrer" },
+        { "key": "X-Robots-Tag", "value": "noindex, nofollow, noarchive" }
+      ]
+    },
+    {
+      "source": "/favicon.ico",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=86400" }
+      ]
+    }
+  ]
+}
